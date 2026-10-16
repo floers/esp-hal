@@ -1545,6 +1545,35 @@ pub struct ContinuousTxTransaction<'ch> {
     channel: Channel<'ch, Blocking, Tx>,
 }
 
+/// Continuous RMT waveform staged in RMT memory, but not yet transmitting.
+/// Used to synchronize the first CKV edge with a separately prepared LCD DMA.
+#[must_use = "call start() to transmit or drop to release the channel"]
+pub struct PreparedContinuousTxTransaction<'ch> {
+    channel: Channel<'ch, Blocking, Tx>,
+    mode: LoopMode,
+}
+
+impl<'ch> PreparedContinuousTxTransaction<'ch> {
+    /// Begin transmission using the previously programmed RMT memory/loop.
+    #[cfg_attr(place_rmt_driver_in_ram, ram)]
+    pub fn start(self) -> ContinuousTxTransaction<'ch> {
+        let raw = self.channel.raw;
+        let mut guard = TxGuard::new(raw);
+        #[cfg(rmt_has_tx_loop_auto_stop)]
+        if self.mode == LoopMode::Finite(0) {
+            guard.set_completed();
+        }
+        if guard.is_active() {
+            raw.start_tx();
+            raw.update();
+        }
+        ContinuousTxTransaction {
+            channel: self.channel,
+            _guard: guard,
+        }
+    }
+}
+
 impl<'ch> ContinuousTxTransaction<'ch> {
     // FIXME: This interface isn't great, since one cannot use the waiting time until tx is stopped
     // for other things! Implement a poll-like interface similar to TxTransaction!
@@ -1808,6 +1837,45 @@ impl<'ch> Channel<'ch, Blocking, Tx> {
         Ok(ContinuousTxTransaction {
             channel: self,
             _guard,
+        })
+    }
+
+    /// Stage a continuous RMT waveform without transmitting yet. The RMT
+    /// memory, loop limit and interrupt state are ready when `start()` is
+    /// called; no additional waveform conversion is needed at the edge.
+    #[cfg_attr(place_rmt_driver_in_ram, ram)]
+    pub fn prepare_transmit_continuously(
+        self,
+        mut data: &[PulseCode],
+        mode: LoopMode,
+    ) -> Result<PreparedContinuousTxTransaction<'ch>, (Error, Self)> {
+        let raw = self.raw;
+        let memsize = raw.memsize();
+
+        #[cfg(rmt_has_tx_loop_count)]
+        if mode.get_count() > MAX_TX_LOOPCOUNT {
+            return Err((Error::InvalidArgument, self));
+        }
+
+        let mut writer = RmtWriter::new();
+        writer.write(&mut data, raw, true);
+        match writer.state() {
+            WriterState::Error(e) => return Err((e, self)),
+            WriterState::Active => return Err((Error::Overflow, self)),
+            WriterState::Done => (),
+        }
+
+        raw.clear_tx_interrupts(EnumSet::all());
+        raw.set_tx_threshold((memsize.codes() / 2) as u8);
+        raw.set_tx_continuous(true);
+        #[cfg(rmt_has_tx_loop_count)]
+        raw.set_loopmode(Some(mode));
+        raw.set_tx_wrap_mode(false);
+        raw.update();
+
+        Ok(PreparedContinuousTxTransaction {
+            channel: self,
+            mode,
         })
     }
 }

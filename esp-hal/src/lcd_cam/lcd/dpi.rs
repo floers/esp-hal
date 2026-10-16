@@ -543,6 +543,83 @@ where
             buffer_view: ManuallyDrop::new(buf.into_view()),
         })
     }
+
+    /// Prepare the LCD DMA transfer without starting the LCD pixel clock.
+    ///
+    /// The caller can now synchronize another peripheral with the LCD start:
+    /// GDMA is already feeding the FIFO when [`DpiPreparedTransfer::start`]
+    /// begins the RGB frame. Dropping the prepared transfer stops GDMA.
+    pub fn prepare_send<TX: DmaTxBuffer>(
+        mut self,
+        next_frame_en: bool,
+        mut buf: TX,
+    ) -> Result<DpiPreparedTransfer<'d, TX, Dm>, (DmaError, Self, TX)> {
+        // Match the working EPDiy driver: clear stale LCD/FIFO data *before*
+        // GDMA begins filling the FIFO. Resetting AFIFO after GDMA starts can
+        // discard the first fetched data, even if DMA later reports success.
+        self.regs()
+            .lcd_user()
+            .modify(|_, w| w.lcd_reset().set_bit());
+        self.regs()
+            .lcd_misc()
+            .modify(|_, w| w.lcd_afifo_reset().set_bit());
+        self.regs().lcd_misc().modify(|_, w| {
+            w.lcd_next_frame_en().bit(next_frame_en)
+        });
+
+        let result = unsafe {
+            self.tx_channel
+                .prepare_transfer(DmaPeripheral::LcdCam, &mut buf)
+        }
+        .and_then(|_| self.tx_channel.start_transfer());
+        if let Err(err) = result {
+            self.tx_channel.stop_transfer();
+            return Err((err, self, buf));
+        }
+
+        Ok(DpiPreparedTransfer {
+            dpi: Some(self),
+            buffer: Some(buf),
+        })
+    }
+}
+
+/// GDMA is running, but the LCD pixel clock has not started. The buffer
+/// remains owned by the transfer until [`Self::start`] or [`Self::stop`].
+pub struct DpiPreparedTransfer<'d, BUF: DmaTxBuffer, Dm: DriverMode> {
+    dpi: Option<Dpi<'d, Dm>>,
+    buffer: Option<BUF>,
+}
+
+impl<'d, BUF: DmaTxBuffer, Dm: DriverMode> DpiPreparedTransfer<'d, BUF, Dm> {
+    /// Start LCD immediately, without preparing DMA again.
+    pub fn start(mut self) -> DpiTransfer<'d, BUF, Dm> {
+        let dpi = self.dpi.take().expect("DPI owned by prepared transfer");
+        let buf = self.buffer.take().expect("DMA buffer owned by prepared transfer");
+        dpi.regs().lcd_user().modify(|_, w| {
+            w.lcd_update().set_bit();
+            w.lcd_start().set_bit()
+        });
+        DpiTransfer {
+            dpi: ManuallyDrop::new(dpi),
+            buffer_view: ManuallyDrop::new(buf.into_view()),
+        }
+    }
+
+    /// Cancel the prepared transfer and return its peripheral and buffer.
+    pub fn stop(mut self) -> (Dpi<'d, Dm>, BUF) {
+        let mut dpi = self.dpi.take().expect("DPI owned by prepared transfer");
+        dpi.tx_channel.stop_transfer();
+        (dpi, self.buffer.take().expect("DMA buffer owned by prepared transfer"))
+    }
+}
+
+impl<BUF: DmaTxBuffer, Dm: DriverMode> Drop for DpiPreparedTransfer<'_, BUF, Dm> {
+    fn drop(&mut self) {
+        if let Some(dpi) = self.dpi.as_mut() {
+            dpi.tx_channel.stop_transfer();
+        }
+    }
 }
 
 /// Represents an ongoing (or potentially finished) transfer using the RGB LCD
@@ -553,6 +630,13 @@ pub struct DpiTransfer<'d, BUF: DmaTxBuffer, Dm: DriverMode> {
 }
 
 impl<'d, BUF: DmaTxBuffer, Dm: DriverMode> DpiTransfer<'d, BUF, Dm> {
+    /// Access the buffer's in-flight view. A `DmaTxBuffer::View` must only
+    /// expose operations safe while DMA is active (e.g. refill a completed
+    /// internal-SRAM bounce block after its EOF notification).
+    pub fn buffer_view_mut(&mut self) -> &mut BUF::View {
+        &mut self.buffer_view
+    }
+
     /// Returns true when [Self::wait] will not block.
     pub fn is_done(&self) -> bool {
         self.dpi.regs().lcd_user().read().lcd_start().bit_is_clear()
